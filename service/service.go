@@ -13,9 +13,11 @@ import (
 
 const MagicNumber = 0x3bef5c
 
+// | Option{MagicNumber: xxx, CodecType: xxx} | Header{ServiceMethod ...} | Body interface{} |
+// | <------      固定 JSON 编码      ------>  | <-------   编码方式由 CodeType 决定    -------> |
 type Option struct {
-	MagicNumber int        // MagicNumber marks this's a geerpc request
-	CodecType   codec.Type // client may choose different Codec to encode body
+	MagicNumber int        // MagicNumber marks this is a mini-rpc request
+	CodecType   codec.Type // clients may choose different Codec to encode body
 }
 
 var DefaultOption = &Option{
@@ -34,8 +36,21 @@ func NewServer() *Server {
 // DefaultServer is the default instance of *Server.
 var DefaultServer = NewServer()
 
+// Accept accepts connections on the listener and serves requests
+// for each incoming connection.
+func (server *Server) Accept(lis net.Listener) {
+	for {
+		conn, err := lis.Accept()
+		if err != nil {
+			log.Println("rpc server: accept error:", err)
+			return
+		}
+		go server.ServeConn(conn) // 开启子协程处理服务连接
+	}
+}
+
 // ServeConn runs the server on a single connection.
-// ServeConn blocks, serving the connection until the client hangs up.
+// ServeConn blocks, serving the connection until the clients hangs up.
 func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer func() { _ = conn.Close() }()
 	var opt Option
@@ -80,11 +95,17 @@ func (server *Server) serveCodec(cc codec.Codec) {
 
 // request stores all information of a call
 type request struct {
-	h            *codec.Header // header of request
+	h *codec.Header // header of request
+
 	argv, replyv reflect.Value // argv and replyv of request
 }
 
-func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
+func (server *Server) readRequest(cc codec.Codec) (*request, error) {
+	//h, err := server.readRequestHeader(cc)
+	//if err != nil {
+	//	return nil, err
+	//}
+
 	var h codec.Header
 	if err := cc.ReadHeader(&h); err != nil {
 		if err != io.EOF && err != io.ErrUnexpectedEOF {
@@ -92,23 +113,26 @@ func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 		}
 		return nil, err
 	}
-	return &h, nil
-}
-
-func (server *Server) readRequest(cc codec.Codec) (*request, error) {
-	h, err := server.readRequestHeader(cc)
-	if err != nil {
-		return nil, err
-	}
-	req := &request{h: h}
+	req := &request{h: &h}
 	// TODO: now we don't know the type of request argv
 	// day 1, just suppose it's string
 	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
+	if err := cc.ReadBody(req.argv.Interface()); err != nil {
 		log.Println("rpc server: read argv err:", err)
 	}
 	return req, nil
 }
+
+//func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
+//	var h codec.Header
+//	if err := cc.ReadHeader(&h); err != nil {
+//		if err != io.EOF && err != io.ErrUnexpectedEOF {
+//			log.Println("rpc server: read header error:", err)
+//		}
+//		return nil, err
+//	}
+//	return &h, nil
+//}
 
 func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
@@ -125,19 +149,6 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 	log.Println(req.h, req.argv.Elem())
 	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
-}
-
-// Accept accepts connections on the listener and serves requests
-// for each incoming connection.
-func (server *Server) Accept(lis net.Listener) {
-	for {
-		conn, err := lis.Accept()
-		if err != nil {
-			log.Println("rpc server: accept error:", err)
-			return
-		}
-		go server.ServeConn(conn)
-	}
 }
 
 // Accept accepts connections on the listener and serves requests

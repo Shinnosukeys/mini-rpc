@@ -7,7 +7,7 @@ import (
 	"io"
 	"log"
 	"mini-rpc/codec"
-	"mini-rpc/service"
+	"mini-rpc/server"
 	"net"
 	"sync"
 )
@@ -15,7 +15,7 @@ import (
 // Call represents an active RPC.
 type Call struct {
 	Seq           uint64
-	ServiceMethod string      // format "<service>.<method>"
+	ServiceMethod string      // format "<server>.<method>"
 	Args          interface{} // arguments to the function
 	Reply         interface{} // reply from the function
 	Error         error       // if error occurs, it will be set
@@ -30,7 +30,7 @@ func (call *Call) done() {
 type Client struct {
 	cc      codec.Codec
 	header  codec.Header //header 只有在请求发送时才需要，而请求发送是互斥的，因此每个客户端只需要一个，声明在 Client 结构体中可以复用
-	opt     *service.Option
+	opt     *server.Option
 	pending map[uint64]*Call //存储未处理完的请求，键是编号，值是 Call 实例
 	mu      sync.Mutex
 	sending sync.Mutex
@@ -150,7 +150,7 @@ func (client *Client) receive() {
 	client.terminateCalls(err)
 }
 
-func NewClient(conn net.Conn, opt *service.Option) (*Client, error) {
+func NewClient(conn net.Conn, opt *server.Option) (*Client, error) {
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
 		err := fmt.Errorf("invalid codec type %s", opt.CodecType)
@@ -167,7 +167,7 @@ func NewClient(conn net.Conn, opt *service.Option) (*Client, error) {
 	return newClientCodec(f(conn), opt), nil
 }
 
-func newClientCodec(cc codec.Codec, opt *service.Option) *Client {
+func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
 	client := &Client{
 		seq:     100, // seq starts with 1, 0 means invalid call
 		cc:      cc,
@@ -178,23 +178,23 @@ func newClientCodec(cc codec.Codec, opt *service.Option) *Client {
 	return client
 }
 
-func checkOptions(opts ...*service.Option) (*service.Option, error) {
+func checkOptions(opts ...*server.Option) (*server.Option, error) {
 	// if opts is nil or pass nil as parameter
 	if len(opts) == 0 || opts[0] == nil {
-		return service.DefaultOption, nil
+		return server.DefaultOption, nil
 	}
 	if len(opts) != 1 {
 		return nil, errors.New("number of options is more than 1")
 	}
 	opt := opts[0]
-	opt.MagicNumber = service.DefaultOption.MagicNumber
+	opt.MagicNumber = server.DefaultOption.MagicNumber
 	if opt.CodecType == "" {
-		opt.CodecType = service.DefaultOption.CodecType
+		opt.CodecType = server.DefaultOption.CodecType
 	}
 	return opt, nil
 }
 
-func Dial(network, address string, opts ...*service.Option) (client *Client, err error) {
+func Dial(network, address string, opts ...*server.Option) (client *Client, err error) {
 	opt, err := checkOptions(opts...)
 	if err != nil {
 		return nil, err

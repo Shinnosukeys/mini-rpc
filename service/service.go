@@ -1,156 +1,115 @@
 package service
 
 import (
-	"encoding/json"
-	"fmt"
-	"io"
+	"go/ast"
 	"log"
-	"mini-rpc/codec"
-	"net"
 	"reflect"
-	"sync"
+	"sync/atomic"
 )
 
-const MagicNumber = 0x3bef5c
-
-// | Option{MagicNumber: xxx, CodecType: xxx} | Header{ServiceMethod ...} | Body interface{} |
-// | <------      固定 JSON 编码      ------>  | <-------   编码方式由 CodeType 决定    -------> |
-type Option struct {
-	MagicNumber int        // MagicNumber marks this is a mini-rpc request
-	CodecType   codec.Type // clients may choose different Codec to encode body
+type Service struct {
+	Name   string
+	Typ    reflect.Type
+	Rcvr   reflect.Value // 结构体实例的本身
+	Method map[string]*MethodType
 }
 
-var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+type MethodType struct {
+	Method    reflect.Method
+	ArgType   reflect.Type
+	ReplyType reflect.Type
+	numCalls  uint64
 }
 
-// Server represents an RPC Server.
-type Server struct{}
-
-// NewServer returns a new Server.
-func NewServer() *Server {
-	return &Server{}
+func (m *MethodType) NumCalls() uint64 {
+	// 使用 sync/atomic 包的 LoadUint64 函数原子地加载 m.numCalls 的值，确保在多线程环境下读取该值的安全性
+	return atomic.LoadUint64(&m.numCalls)
 }
 
-// DefaultServer is the default instance of *Server.
-var DefaultServer = NewServer()
-
-// Accept accepts connections on the listener and serves requests
-// for each incoming connection.
-func (server *Server) Accept(lis net.Listener) {
-	for {
-		conn, err := lis.Accept()
-		if err != nil {
-			log.Println("rpc server: accept error:", err)
-			return
-		}
-		go server.ServeConn(conn) // 开启子协程处理服务连接
+func (m *MethodType) NewArgv() reflect.Value {
+	var argv reflect.Value
+	// arg may be a pointer type, or a value type
+	// 指针类型和值类型创建实例的方式有细微区别
+	if m.ArgType.Kind() == reflect.Ptr {
+		// 创建一个指向该类型的指针
+		argv = reflect.New(m.ArgType.Elem())
+	} else {
+		// 创建一个该类型的值
+		argv = reflect.New(m.ArgType).Elem()
 	}
+	return argv
 }
 
-// ServeConn runs the server on a single connection.
-// ServeConn blocks, serving the connection until the clients hangs up.
-func (server *Server) ServeConn(conn io.ReadWriteCloser) {
-	defer func() { _ = conn.Close() }()
-	var opt Option
-	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
-		log.Println("rpc server: options error: ", err)
-		return
+func (m *MethodType) NewReplyv() reflect.Value {
+	// reply must be a pointer type
+	replyv := reflect.New(m.ReplyType.Elem())
+	switch m.ReplyType.Elem().Kind() {
+	case reflect.Map:
+		replyv.Elem().Set(reflect.MakeMap(m.ReplyType.Elem()))
+	case reflect.Slice:
+		replyv.Elem().Set(reflect.MakeSlice(m.ReplyType.Elem(), 0, 0))
 	}
-	if opt.MagicNumber != MagicNumber {
-		log.Printf("rpc server: invalid magic number %x", opt.MagicNumber)
-		return
-	}
-	f := codec.NewCodecFuncMap[opt.CodecType]
-	if f == nil {
-		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
-		return
-	}
-	server.serveCodec(f(conn))
+	return replyv
 }
 
-// invalidRequest is a placeholder for response argv when error occurs
-var invalidRequest = struct{}{}
+func NewService(rcvr interface{}) *Service {
+	s := new(Service)
+	s.Rcvr = reflect.ValueOf(rcvr)
 
-func (server *Server) serveCodec(cc codec.Codec) {
-	sending := new(sync.Mutex) // make sure to send a complete response
-	wg := new(sync.WaitGroup)  // wait until all request are handled
-	for {
-		req, err := server.readRequest(cc)
-		if err != nil {
-			if req == nil {
-				break // it's not possible to recover, so close the connection
-			}
-			req.h.Error = err.Error()
-			server.sendResponse(cc, req.h, invalidRequest, sending)
+	// 如果是指针类型，它会返回空指针；如果不是指针类型，它会直接返回 s.Rcvr 本身
+	//s.Name = s.Rcvr.Type().Name()
+
+	// 如果是指针类型，它会返回指针所指向的值的反射值；如果不是指针类型，它会直接返回 s.Rcvr 本身
+	s.Name = reflect.Indirect(s.Rcvr).Type().Name()
+
+	s.Typ = reflect.TypeOf(rcvr)
+	// 检查服务名称是否为导出的标识符,如果以大写字母开头，那么它就是导出的，可以被其他包访问
+	if !ast.IsExported(s.Name) {
+		log.Fatalf("rpc server: %s is not a valid Service Name", s.Name)
+	}
+	s.registerMethods()
+	return s
+}
+
+func (s *Service) registerMethods() {
+	s.Method = make(map[string]*MethodType)
+	for i := 0; i < s.Typ.NumMethod(); i++ {
+		method := s.Typ.Method(i)
+		//mType := Method.Type
+		// 筛选符合特定参数和返回值数量要求的方法
+		if method.Type.NumIn() != 3 || method.Type.NumOut() != 1 {
 			continue
 		}
-		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg)
-	}
-	wg.Wait()
-	_ = cc.Close()
-}
 
-// request stores all information of a call
-type request struct {
-	h *codec.Header // header of request
-
-	argv, replyv reflect.Value // argv and replyv of request
-}
-
-func (server *Server) readRequest(cc codec.Codec) (*request, error) {
-	//h, err := server.readRequestHeader(cc)
-	//if err != nil {
-	//	return nil, err
-	//}
-
-	var h codec.Header
-	if err := cc.ReadHeader(&h); err != nil {
-		if err != io.EOF && err != io.ErrUnexpectedEOF {
-			log.Println("rpc server: read header error:", err)
+		// 检查返回值类型是否为 error
+		if method.Type.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
+			continue
 		}
-		return nil, err
-	}
-	req := &request{h: &h}
-	// TODO: now we don't know the type of request argv
-	// day 1, just suppose it's string
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err := cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read argv err:", err)
-	}
-	return req, nil
-}
+		argType, replyType := method.Type.In(1), method.Type.In(2)
+		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType) {
+			continue
+		}
 
-//func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
-//	var h codec.Header
-//	if err := cc.ReadHeader(&h); err != nil {
-//		if err != io.EOF && err != io.ErrUnexpectedEOF {
-//			log.Println("rpc server: read header error:", err)
-//		}
-//		return nil, err
-//	}
-//	return &h, nil
-//}
-
-func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
-	sending.Lock()
-	defer sending.Unlock()
-	if err := cc.Write(h, body); err != nil {
-		log.Println("rpc server: write response error:", err)
+		s.Method[method.Name] = &MethodType{
+			Method:    method,
+			ArgType:   argType,
+			ReplyType: replyType,
+		}
+		log.Printf("rpc server: register %s.%s\n", s.Name, method.Name)
 	}
 }
 
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
-	// TODO, should call registered rpc methods to get the right replyv
-	// day 1, just print argv and send a hello message
-	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+func isExportedOrBuiltinType(t reflect.Type) bool {
+	return ast.IsExported(t.Name()) || t.PkgPath() == ""
 }
 
-// Accept accepts connections on the listener and serves requests
-// for each incoming connection.
-func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
+// 实现 Call 方法，即能够通过反射值调用方法
+func (s *Service) Call(m *MethodType, argv, replyv reflect.Value) error {
+	atomic.AddUint64(&m.numCalls, 1)
+	f := m.Method.Func
+	returnValues := f.Call([]reflect.Value{s.Rcvr, argv, replyv})
+	if errInter := returnValues[0].Interface(); errInter != nil {
+		return errInter.(error)
+	}
+	return nil
+}

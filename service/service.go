@@ -1,17 +1,19 @@
 package service
 
 import (
+	"fmt"
 	"go/ast"
 	"log"
+	"mini-rpc/logger"
 	"reflect"
 	"sync/atomic"
 )
 
 type Service struct {
-	Name   string
-	Typ    reflect.Type
-	Rcvr   reflect.Value // 结构体实例的本身
-	Method map[string]*MethodType
+	Name    string
+	Typ     reflect.Type
+	Rcvr    reflect.Value // 结构体实例的本身
+	Methods map[string]*MethodType
 }
 
 type MethodType struct {
@@ -63,6 +65,11 @@ func NewService(rcvr interface{}) *Service {
 	s.Name = reflect.Indirect(s.Rcvr).Type().Name()
 
 	s.Typ = reflect.TypeOf(rcvr)
+	logger.ServerLog("service类型的名称为: " + s.Typ.Elem().Name())
+	logger.ServerLog(fmt.Sprintf("该类型的方法数量为: %d", s.Typ.NumMethod()))
+	for i := 0; i < s.Typ.NumMethod(); i++ {
+		logger.ServerLog(fmt.Sprintf("第%d个方法的名称: "+s.Typ.Method(0).Name, i+1))
+	}
 	// 检查服务名称是否为导出的标识符,如果以大写字母开头，那么它就是导出的，可以被其他包访问
 	if !ast.IsExported(s.Name) {
 		log.Fatalf("rpc server: %s is not a valid Service Name", s.Name)
@@ -72,11 +79,12 @@ func NewService(rcvr interface{}) *Service {
 }
 
 func (s *Service) registerMethods() {
-	s.Method = make(map[string]*MethodType)
+	s.Methods = make(map[string]*MethodType)
 	for i := 0; i < s.Typ.NumMethod(); i++ {
 		method := s.Typ.Method(i)
-		//mType := Method.Type
+		//mType := Methods.Type
 		// 筛选符合特定参数和返回值数量要求的方法
+		// 要求输入参数数量为 3 而不是 2（args 和 reply），是因为在 Go 语言里，方法的第一个输入参数是接收者（receiver）
 		if method.Type.NumIn() != 3 || method.Type.NumOut() != 1 {
 			continue
 		}
@@ -85,17 +93,18 @@ func (s *Service) registerMethods() {
 		if method.Type.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
 			continue
 		}
+
 		argType, replyType := method.Type.In(1), method.Type.In(2)
 		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType) {
 			continue
 		}
 
-		s.Method[method.Name] = &MethodType{
+		s.Methods[method.Name] = &MethodType{
 			Method:    method,
 			ArgType:   argType,
 			ReplyType: replyType,
 		}
-		log.Printf("rpc server: register %s.%s\n", s.Name, method.Name)
+		logger.ServerLog(fmt.Sprintf("rpc serve register method: %s.%s", s.Name, method.Name))
 	}
 }
 

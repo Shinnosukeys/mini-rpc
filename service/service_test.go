@@ -15,7 +15,7 @@ func (f Foo) Sum(args Args, reply *int) error {
 	return nil
 }
 
-// it's not a exported Method
+// it's not a exported Methods
 func (f Foo) sum(args Args, reply *int) error {
 	*reply = args.Num1 + args.Num2
 	return nil
@@ -30,15 +30,15 @@ func _assert(condition bool, msg string, v ...interface{}) {
 func TestNewService(t *testing.T) {
 	var foo Foo
 	s := NewService(&foo)
-	_assert(len(s.Method) == 1, "wrong Service Method, expect 1, but got %d", len(s.Method))
-	mType := s.Method["Sum"]
-	_assert(mType != nil, "wrong Method, Sum shouldn't nil")
+	_assert(len(s.Methods) == 1, "wrong Service Methods, expect 1, but got %d", len(s.Methods))
+	mType := s.Methods["Sum"]
+	_assert(mType != nil, "wrong Methods, Sum shouldn't nil")
 }
 
 func TestMethodType_Call(t *testing.T) {
 	var foo Foo
 	s := NewService(&foo)
-	mType := s.Method["Sum"]
+	mType := s.Methods["Sum"]
 
 	argv := mType.NewArgv()
 	replyv := mType.NewReplyv()

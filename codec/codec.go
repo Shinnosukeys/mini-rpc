@@ -5,7 +5,7 @@ import (
 )
 
 type Header struct {
-	ServiceMethod string // format "Service.Method"
+	ServiceMethod string // format "Service.Methods"
 	Seq           uint64 // sequence number chosen by clients
 	Error         string
 }

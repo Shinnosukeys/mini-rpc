@@ -68,7 +68,7 @@ func NewService(rcvr interface{}) *Service {
 	logger.ServerLog("service类型的名称为: " + s.Typ.Elem().Name())
 	logger.ServerLog(fmt.Sprintf("该类型的方法数量为: %d", s.Typ.NumMethod()))
 	for i := 0; i < s.Typ.NumMethod(); i++ {
-		logger.ServerLog(fmt.Sprintf("第%d个方法的名称: "+s.Typ.Method(0).Name, i+1))
+		logger.ServerLog(fmt.Sprintf("第%d个方法的名称: "+s.Typ.Method(i).Name, i+1))
 	}
 	// 检查服务名称是否为导出的标识符,如果以大写字母开头，那么它就是导出的，可以被其他包访问
 	if !ast.IsExported(s.Name) {
@@ -116,6 +116,7 @@ func isExportedOrBuiltinType(t reflect.Type) bool {
 func (s *Service) Call(m *MethodType, argv, replyv reflect.Value) error {
 	atomic.AddUint64(&m.numCalls, 1)
 	f := m.Method.Func
+	logger.ServerLog("Call方法 执行具体的方法函数：f.Call()")
 	returnValues := f.Call([]reflect.Value{s.Rcvr, argv, replyv})
 	if errInter := returnValues[0].Interface(); errInter != nil {
 		return errInter.(error)

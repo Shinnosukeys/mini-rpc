@@ -10,23 +10,35 @@ import (
 	"mini-rpc/logger"
 	"mini-rpc/service"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
-const MagicNumber = 0x3bef5c
+const (
+	MagicNumber      = 0x3bef5c
+	Connected        = "200 Connected to Mini RPC"
+	DefaultRPCPath   = "/_miniprc_"
+	DefaultDebugPath = "/debug/minirpc"
+)
 
 // | Option{MagicNumber: xxx, CodecType: xxx} | Header{ServiceMethod ...} | Body interface{} |
 // | <------      固定 JSON 编码      ------>  | <-------   编码方式由 CodeType 决定    -------> |
 type Option struct {
 	MagicNumber int        // MagicNumber marks this is a mini-rpc request
 	CodecType   codec.Type // clients may choose different Codec to encode body
+
+	ConnectTimeout time.Duration // 0 means no limit
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
 	MagicNumber: MagicNumber,
 	CodecType:   codec.GobType,
+
+	ConnectTimeout: time.Second * 10,
 }
 
 // request stores all information of a call
@@ -41,7 +53,7 @@ type request struct {
 // Server represents an RPC Server.
 type Server struct {
 	// sync.Map是Go语言标准库中提供的并发安全的映射，用于在多个 goroutine 同时访问时保证数据的一致性
-	serviceMap sync.Map
+	ServiceMap sync.Map
 }
 
 // NewServer returns a new Server.
@@ -57,7 +69,7 @@ func (server *Server) Register(rcvr interface{}) error {
 	logger.ServerLog("初始化service: service.NewService(rcvr)")
 	s := service.NewService(rcvr)
 	logger.ServerLog("将初始化后的service放入sync.Map: server.serviceMap.LoadOrStore(s.Name, s)")
-	if _, dup := server.serviceMap.LoadOrStore(s.Name, s); dup {
+	if _, dup := server.ServiceMap.LoadOrStore(s.Name, s); dup {
 		return errors.New("rpc: service already defined: " + s.Name)
 	}
 	return nil
@@ -73,7 +85,7 @@ func (server *Server) findService(serviceMethod string) (svc *service.Service, m
 		return
 	}
 	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
-	svci, ok := server.serviceMap.Load(serviceName)
+	svci, ok := server.ServiceMap.Load(serviceName)
 	if !ok {
 		err = errors.New("rpc server: can't find service " + serviceName)
 		return
@@ -129,13 +141,13 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	}
 	// get codec.Codec
 	cc := codecFuncMap(conn)
-	server.serveCodec(cc)
+	server.serveCodec(cc, &opt)
 }
 
 // invalidRequest is a placeholder for response argv when error occurs
 var invalidRequest = struct{}{}
 
-func (server *Server) serveCodec(cc codec.Codec) {
+func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex) // make sure to send a complete response
 	wg := new(sync.WaitGroup)  // wait until all request are handled
 	logger.ServerLog("开始进入for循环，并通过指定编解码器（codec.Codec）处理接收到的客户端请求！！！")
@@ -144,7 +156,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 	// 3. 在循环中，如果读取或处理某个请求时出现错误，服务器可以根据错误类型进行相应的处理（如发送错误响应），然后继续循环读取下一个请求，而不会因为一个请求的错误而关闭整个连接，从而实现一定程度的错误恢复和持续服务
 	for {
 		req, err := server.readRequest(cc)
-		logger.ServerLog("server.readRequest(cc) 读取到一个请求: " + req.String())
+		//logger.ServerLog("server.readRequest(cc) 读取到一个请求: " + req.String())
 		if err != nil {
 			if req == nil {
 				break // it's not possible to recover, so close the connection
@@ -154,7 +166,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -177,7 +189,6 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	}
 	logger.ServerLog(fmt.Sprintf("cc.ReadHeader(&h)方法读取到对应的响应头: cc.ReadHeader(&h), 请求序列: %d", h.Seq))
 	req := &request{h: &h}
-	// TODO: now we don't know the type of request argv
 	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
 	if err != nil {
 		return req, err
@@ -202,7 +213,9 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 
 	if err := cc.ReadBody(argvi); err != nil {
 		log.Println("rpc server: read argv err:", err)
+		return req, err
 	}
+	log.Println(req.replyv.Elem().Type())
 	logger.ServerLog(fmt.Sprintf("cc.ReadBody(argvi) 方法读取到对应的响应体: cc.ReadBody(argvi), 请求序列: %d", req.h.Seq))
 	return req, nil
 }
@@ -221,80 +234,102 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
+	log.Println("h.Error: " + h.Error)
 	if err := cc.Write(h, body); err != nil {
 		log.Println("rpc server: write response error:", err)
 	}
 }
 
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+type serverResult struct {
+	req *request
+	err error
+}
+
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	// TODO, should call registered rpc methods to get the right reply
 	// day 1, just print argv and send a hello message
 	defer wg.Done()
 	//log.Println(req.h, req.argv.Elem())
 	//req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
-	err := req.svc.Call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, sending)
+
+	// err := req.svc.Call(req.mtype, req.argv, req.replyv)
+	// 超时处理
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		log.Println("打印req.argv和req.replyv")
+		err := req.svc.Call(req.mtype, req.argv, req.replyv)
+		log.Println("req.svc.Call(req.mtype, req.argv, req.replyv)执行完毕")
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			logger.ServerLog(fmt.Sprintf("sendResponse 准备发送处理后的请求: reqSeq: %d", req.h.Seq))
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		//logger.ServerLog("sendResponse 准备发送处理后的请求: " + req.String())
+		logger.ServerLog(fmt.Sprintf("sendResponse 准备发送处理后的请求: reqSeq: %d", req.h.Seq))
+		server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	logger.ServerLog("sendResponse 准备发送处理后的请求: " + req.String())
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
-	//log.Printf("sendResponse 发送处理后的请求完毕！！！: %s\n", req)
+
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		//logger.ServerLog("sendResponse 准备发送处理后的请求: " + req.String())
+		log.Printf("超过了是handletime: %d\n", timeout)
+		logger.ServerLog(fmt.Sprintf("sendResponse 准备发送处理后的请求: reqSeq: %d", req.h.Seq))
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		<-sent
+	}
 }
 
 // Accept accepts connections on the listener and serves requests
 // for each incoming connection.
 func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
 
-func (r *request) String() string {
-	var argStr, replyStr string
-	// 处理 argv 字段
-	if r.argv.IsValid() && r.argv.CanInterface() {
-		argStr = fmt.Sprintf("%v", r.argv.Interface())
+// Server 类型实现了 ServeHTTP 方法，所以 Server 类型的实例能够当作 HTTP 处理器来处理 HTTP 请求
+// ServeHTTP implements a http.Handler that answers RPC requests.
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
 	}
-	// 处理 replyv 字段
-	if r.replyv.IsValid() {
-		// 检查 replyv 是否为指针类型
-		if r.replyv.Kind() == reflect.Ptr {
-			// 解引用指针
-			replyvValue := r.replyv.Elem()
-			if replyvValue.IsValid() && replyvValue.CanInterface() {
-				replyStr = fmt.Sprintf("%v", replyvValue.Interface())
-			}
-		} else if r.replyv.CanInterface() {
-			replyStr = fmt.Sprintf("%v", r.replyv.Interface())
-		}
+	// Hijack 方法会将底层的 TCP 连接从 HTTP 服务器中分离出来，交给调用者管理
+	// 此时 HTTP 服务器会将连接的控制权完全交给 RPC 服务，但仍依赖 http.Serve 的底层循环来持续监听新连接
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
 	}
-	// 提取 h 字段的信息
-	var serviceMethod string
-	if r.h != nil {
-		serviceMethod = r.h.ServiceMethod
-	}
-	// 提取 svc 字段的信息
-	var serviceName string
-	if r.svc != nil {
-		serviceName = r.svc.Name
-	}
-	// 提取 mtype 字段的信息
-	var methodName string
-	var argTypeName string
-	var replyTypeName string
-	if r.mtype != nil {
-		methodName = r.mtype.Method.Name
-		if r.mtype.ArgType != nil {
-			argTypeName = r.mtype.ArgType.Name()
-		}
-		if r.mtype.ReplyType != nil {
-			// 处理指针类型的 ReplyType
-			if r.mtype.ReplyType.Kind() == reflect.Ptr {
-				replyTypeName = r.mtype.ReplyType.Elem().Name()
-			} else {
-				replyTypeName = r.mtype.ReplyType.Name()
-			}
-		}
-	}
-	// 格式化输出，添加 serviceMethod 信息
-	return fmt.Sprintf("服务方法: %s, 服务名: %s, 方法名: %s, 请求参数类型: %s, 请求参数值: %s, 响应参数类型: %s, 响应参数值: %s",
-		serviceMethod, serviceName, methodName, argTypeName, argStr, replyTypeName, replyStr)
+
+	// 在成功接管连接后，向客户端发送一个简单的 HTTP 响应头（HTTP/1.0）
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+Connected+"\n\n")
+	// 调用 server.ServeConn(conn) 方法处理 RPC 请求
+	server.ServeConn(conn)
+}
+
+// HandleHTTP registers an HTTP handler for RPC messages on rpcPath.
+// It is still necessary to invoke http.Serve(), typically in a go statement.
+func (server *Server) HandleHTTP() {
+	// 通过 http.Handle 方法将 DefaultRPCPath（默认的 RPC 路径）与 server 绑定
+	// 当客户端访问 DefaultRPCPath 时，请求会被 ServeHTTP 方法处理。
+	http.Handle(DefaultRPCPath, server)
+	http.Handle(DefaultDebugPath, DebugHTTP{Server: server})
+	log.Println("rpc server debug path:", DefaultDebugPath)
+}
+
+// HandleHTTP is a convenient approach for default server to register HTTP handlers
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }

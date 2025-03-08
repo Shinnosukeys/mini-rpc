@@ -1,6 +1,8 @@
 package clients
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,9 +11,11 @@ import (
 	"mini-rpc/codec"
 	"mini-rpc/logger"
 	"mini-rpc/server"
-	"mini-rpc/types"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
+	"time"
 )
 
 // Call represents an active RPC.
@@ -24,22 +28,30 @@ type Call struct {
 	Done          chan *Call  // Strobes when call is complete.
 }
 
+type Client struct {
+	cc       codec.Codec
+	header   codec.Header //header 只有在请求发送时才需要，而请求发送是互斥的，因此每个客户端只需要一个，声明在 Client 结构体中可以复用
+	opt      *server.Option
+	pending  map[uint64]*Call //存储未处理完的请求，键是编号，值是 Call 实例
+	mu       sync.Mutex
+	sending  sync.Mutex
+	seq      uint64
+	closed   bool
+	shutdown bool // server has told us to stop
+}
+
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+var _ io.Closer = (*Client)(nil)
+
 // 当调用结束时，会调用 call.done() 通知调用方
 func (call *Call) done() {
 	logger.ClientLog(fmt.Sprintf("请求处理完成，服务方法: %s，准备将结果发送到 Done 通道。callSeq: %d", call.ServiceMethod, call.Seq))
 	call.Done <- call
 	logger.ClientLog(fmt.Sprintf("结果已发送到 Done 通道，服务方法: %s", call.ServiceMethod))
-}
-
-type Client struct {
-	cc      codec.Codec
-	header  codec.Header //header 只有在请求发送时才需要，而请求发送是互斥的，因此每个客户端只需要一个，声明在 Client 结构体中可以复用
-	opt     *server.Option
-	pending map[uint64]*Call //存储未处理完的请求，键是编号，值是 Call 实例
-	mu      sync.Mutex
-	sending sync.Mutex
-	seq     uint64
-	closed  bool
 }
 
 func (client *Client) Close() error {
@@ -52,7 +64,12 @@ func (client *Client) Close() error {
 	return nil
 }
 
-var _ io.Closer = (*Client)(nil)
+// IsAvailable return true if the client does work
+func (client *Client) IsAvailable() bool {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return !client.shutdown && !client.closed
+}
 
 // 将参数 call 添加到 clients.pending 中，并更新 clients.seq
 func (client *Client) registerCall(call *Call) (uint64, error) {
@@ -132,7 +149,6 @@ func (client *Client) send(call *Call) {
 		if call != nil {
 			call.Error = err
 			call.done()
-
 		}
 	}
 }
@@ -143,9 +159,11 @@ func (client *Client) receive() {
 	for err == nil {
 		var h codec.Header
 		err = client.cc.ReadHeader(&h)
+		log.Println("client端的h.err: " + h.Error)
 		logger.ClientLog(fmt.Sprintf("cc.ReadHeader(&h)方法读取到对应的响应头: client.cc.ReadHeader(&h), CallSeq:%d", h.Seq))
 		if err != nil {
-			client.terminateCalls(err)
+			//client.terminateCalls(err)
+			break
 		}
 		callSeq := h.Seq
 		logger.ClientLog(fmt.Sprintf("从客户端的 pending 映射中移除对应的 call 并返回: client.removeCall(callSeq), CallSeq:%d", h.Seq))
@@ -155,8 +173,9 @@ func (client *Client) receive() {
 		case call == nil:
 			err = client.cc.ReadBody(nil)
 		// 可能是请求没有发送完整，或者因为其他原因被取消，但是服务端仍旧处理了
-		case call.Error != nil:
-			err = call.Error
+		case h.Error != "":
+			call.Error = fmt.Errorf(h.Error)
+			err = client.cc.ReadBody(nil)
 			call.done()
 		// 请求正常
 		default:
@@ -164,7 +183,7 @@ func (client *Client) receive() {
 			if err != nil {
 				call.Error = errors.New("reading body " + err.Error())
 			}
-			logger.ClientLog(fmt.Sprintf("cc.ReadHeader(&h)方法读取到对应的响应体: client.cc.ReadBody(call.Reply), CallSeq:%d", h.Seq))
+			logger.ClientLog(fmt.Sprintf("cc.ReadBody(call.Reply)方法读取到对应的响应体: client.cc.ReadBody(call.Reply), CallSeq:%d", h.Seq))
 			call.done()
 		}
 	}
@@ -219,26 +238,47 @@ func checkOptions(opts ...*server.Option) (*server.Option, error) {
 	return opt, nil
 }
 
-func Dial(network, address string, opts ...*server.Option) (client *Client, err error) {
+type newClientFunc func(conn net.Conn, opt *server.Option) (client *Client, err error)
+
+func dialTimeout(f newClientFunc, network, address string, opts ...*server.Option) (client *Client, err error) {
 	logger.ClientLog("检查Option是否符合要求: checkOptions(opts...)")
 	opt, err := checkOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-
-	logger.ClientLog("向服务端发送连接请求: net.Dial(network, address)")
-	conn, err := net.Dial(network, address)
+	logger.ClientLog("向服务端发送连接请求: net.DialTimeout(network, address, opt.ConnectTimeout)")
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
-
+	// close the connection if client is nil
 	defer func() {
-		if client == nil {
+		if err != nil {
 			_ = conn.Close()
 		}
 	}()
-	logger.ClientLog("调用 NewClient 函数创建一个新的客户端实例: NewClient(conn, opt)")
-	return NewClient(conn, opt)
+	ch := make(chan clientResult)
+	go func() {
+		logger.ClientLog("调用 NewClient 函数创建一个新的客户端实例: NewClient(conn, opt)")
+		client, err := f(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	// <-time.After(opt.ConnectTimeout) 表示从 time.After(opt.ConnectTimeout) 返回的通道中接收数据。
+	// 当经过 opt.ConnectTimeout 时间后，该通道会有数据可用，此时 <-time.After(opt.ConnectTimeout) 表达式会解除阻塞，然后执行对应的 case 分支代码，返回连接超时的错误信息
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
+}
+
+func Dial(network, address string, opts ...*server.Option) (client *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 // Go invokes the function asynchronously.
@@ -253,32 +293,81 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 		ServiceMethod: serviceMethod,
 		Args:          args,
 		Reply:         reply,
-		Done:          done,
+		Done:          done, // 显式地将通道作为参数传递给协程 go client.send(call)
 	}
-	argObj, ok := args.(*types.Args)
-	if !ok {
-		logger.ClientLog("传入的 args 不是 *Args 类型，无法获取具体值")
-	}
+	//argObj, ok := args.(*types.Args)
+	//if !ok {
+	//	logger.ClientLog("传入的 args 不是 *Args 类型，无法获取具体值")
+	//}
 
-	logger.ClientLog(fmt.Sprintf("Go 方法开始，发起对 %s 的异步调用, 计算 %d+%d", serviceMethod, argObj.Num1, argObj.Num2))
 	go client.send(call)
-	logger.ClientLog(fmt.Sprintf("Go 方法返回 Call 对象，等待异步调用完成，服务方法: %s 计算 %d+%d", serviceMethod, argObj.Num1, argObj.Num2))
 	return call
 }
 
 // Call invokes the named function, waits for it to complete,
 // and returns its error status.
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
+// 如果使用无缓冲通道，send 协程在发送数据时会阻塞，直到 Call 方法中的 <-client.Go(...).Done 操作接收数据。
+// 而使用容量为 1 的缓冲通道，只要通道还有空间（这里初始时容量为 1，所以有一个空位），
+// send 协程就可以立即将 call 对象发送到通道中，不会被阻塞，这样可以提高程序的并发性能
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
 	// 调用 Go 方法发起异步调用，并通过 <- 操作符从 done 通道中接收调用结果
 	// 进行类型断言，将 args 转换为 *Args 类型
-	argObj, ok := args.(*types.Args)
-	if !ok {
-		logger.ClientLog("传入的 args 不是 *Args 类型，无法获取具体值")
-	}
+	//argObj, ok := args.(*types.Args)
+	//if !ok {
+	//	logger.ClientLog("传入的 args 不是 *Args 类型，无法获取具体值")
+	//}
 	// <-client.Go(...).Done 是一个阻塞操作，它会等待 Done 通道中有数据发送过来，也就是等待远程调用完成。
 	// 一旦远程调用完成，结果会通过 Done 通道发送回来，此时 <-client.Go(...).Done 会解除阻塞并返回调用结果
-	logger.ClientLog(fmt.Sprintf("Call 方法调用 Go 方法，计算 %d+%d", argObj.Num1, argObj.Num2))
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	logger.ClientLog(fmt.Sprintf("Call 方法接收到异步调用结果，计算 %d+%d", argObj.Num1, argObj.Num2))
-	return call.Error
+	logger.ClientLog(fmt.Sprintf("Call 方法调用 Go 方法"))
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case call := <-call.Done:
+		logger.ClientLog(fmt.Sprintf("Call 方法接收到异步调用结果, callSeq: %d", call.Seq))
+		fmt.Println("call.Error: ", call.Error)
+		return call.Error
+	}
+}
+
+// NewHTTPClient new a Client instance via HTTP as transport protocol
+func NewHTTPClient(conn net.Conn, opt *server.Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", server.DefaultRPCPath))
+
+	// Require successful HTTP response
+	// before switching to RPC protocol.
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == server.Connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+// DialHTTP connects to an HTTP RPC server at the specified network address
+// listening on the default HTTP RPC path.
+func DialHTTP(network, address string, opts ...*server.Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// XDial calls different functions to connect to a RPC server
+// according the first parameter rpcAddr.
+// rpcAddr is a general format (protocol@addr) to represent a rpc server
+// eg, http@10.0.0.1:7001, tcp@10.0.0.1:9999, unix@/tmp/geerpc.sock
+func XDial(rpcAddr string, opts ...*server.Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp, unix or other transport protocol
+		return Dial(protocol, addr, opts...)
+	}
 }

@@ -49,9 +49,7 @@ var _ io.Closer = (*Client)(nil)
 
 // 当调用结束时，会调用 call.done() 通知调用方
 func (call *Call) done() {
-	logger.ClientLog(fmt.Sprintf("请求处理完成，服务方法: %s，准备将结果发送到 Done 通道。callSeq: %d", call.ServiceMethod, call.Seq))
 	call.Done <- call
-	logger.ClientLog(fmt.Sprintf("结果已发送到 Done 通道，服务方法: %s", call.ServiceMethod))
 }
 
 func (client *Client) Close() error {
@@ -77,9 +75,7 @@ func (client *Client) registerCall(call *Call) (uint64, error) {
 	client.mu.Lock()
 	defer func() {
 		client.mu.Unlock()
-		logger.ClientLog(fmt.Sprintf("registerCall方法 lient.mu.Lock()互斥锁进行解锁，此时请求编号: %d", client.seq-1))
 	}()
-	logger.ClientLog(fmt.Sprintf("registerCall方法 lient.mu.Lock()互斥锁进行加锁，此时请求编号: %d", client.seq))
 
 	if client.closed {
 		return 0, errors.New("clients already closed")
@@ -97,9 +93,7 @@ func (client *Client) removeCall(seq uint64) *Call {
 	client.mu.Lock()
 	defer func() {
 		client.mu.Unlock()
-		logger.ClientLog(fmt.Sprintf("removeCall方法 lient.mu.Lock()互斥锁进行解锁，此时请求编号: %d", seq))
 	}()
-	logger.ClientLog(fmt.Sprintf("removeCall方法 lient.mu.Lock()互斥锁进行加锁，此时请求编号: %d", seq))
 
 	if client.closed {
 		return nil
@@ -126,9 +120,7 @@ func (client *Client) send(call *Call) {
 	client.sending.Lock()
 	defer func() {
 		client.sending.Unlock()
-		logger.ClientLog(fmt.Sprintf("send方法准备完毕 client.sending.Unlock() 互斥锁进行解锁，此时请求编号: %d", client.seq-1))
 	}()
-	logger.ClientLog(fmt.Sprintf("send方法准备执行 client.sending.Lock() 互斥锁进行加锁，此时请求编号: %d", client.seq))
 
 	// 注册一个请求
 	seq, err := client.registerCall(call)
@@ -155,18 +147,15 @@ func (client *Client) send(call *Call) {
 
 func (client *Client) receive() {
 	var err error
-	logger.ClientLog("receive()方法 进入一个循环，只要没有错误就继续接收服务端的响应")
+	logger.ClientLog("receive()方法 开始进入for循环，只要没有错误就不断接收服务端的响应!!!")
 	for err == nil {
 		var h codec.Header
 		err = client.cc.ReadHeader(&h)
-		log.Println("client端的h.err: " + h.Error)
-		logger.ClientLog(fmt.Sprintf("cc.ReadHeader(&h)方法读取到对应的响应头: client.cc.ReadHeader(&h), CallSeq:%d", h.Seq))
 		if err != nil {
 			//client.terminateCalls(err)
 			break
 		}
 		callSeq := h.Seq
-		logger.ClientLog(fmt.Sprintf("从客户端的 pending 映射中移除对应的 call 并返回: client.removeCall(callSeq), CallSeq:%d", h.Seq))
 		call := client.removeCall(callSeq)
 		switch {
 		// 可能是请求没有发送完整，或者因为其他原因被取消，但是服务端仍旧处理了
@@ -183,7 +172,6 @@ func (client *Client) receive() {
 			if err != nil {
 				call.Error = errors.New("reading body " + err.Error())
 			}
-			logger.ClientLog(fmt.Sprintf("cc.ReadBody(call.Reply)方法读取到对应的响应体: client.cc.ReadBody(call.Reply), CallSeq:%d", h.Seq))
 			call.done()
 		}
 	}
@@ -191,22 +179,20 @@ func (client *Client) receive() {
 }
 
 func NewClient(conn net.Conn, opt *server.Option) (*Client, error) {
-	newCodecFuncMap := codec.NewCodecFuncMap[opt.CodecType]
-	if newCodecFuncMap == nil {
+	newCodecFunc := codec.NewCodecFuncMap[opt.CodecType]
+	if newCodecFunc == nil {
 		err := fmt.Errorf("invalid codec type %s", opt.CodecType)
 		log.Println("rpc clients: codec error:", err)
 		return nil, err
 	}
 	// send options with server
 	// 发送选项信息
-	logger.ClientLog("将选项信息发送到服务端: json.NewEncoder(conn).Encode(opt)")
 	if err := json.NewEncoder(conn).Encode(opt); err != nil {
 		log.Println("rpc clients: options error: ", err)
 		_ = conn.Close()
 		return nil, err
 	}
-	cc := newCodecFuncMap(conn)
-	logger.ClientLog("调用 newClientCodec 函数，传入编解码器实例和选项信息，创建一个新的客户端实例: newClientCodec(cc, opt)")
+	cc := newCodecFunc(conn)
 	return newClientCodec(cc, opt), nil
 }
 
@@ -217,7 +203,6 @@ func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
 		opt:     opt,
 		pending: make(map[uint64]*Call),
 	}
-	logger.ClientLog("启动一个新的协程，调用 client.receive 方法，用于接收服务端的响应: go client.receive()")
 	go client.receive()
 	return client
 }
@@ -241,12 +226,10 @@ func checkOptions(opts ...*server.Option) (*server.Option, error) {
 type newClientFunc func(conn net.Conn, opt *server.Option) (client *Client, err error)
 
 func dialTimeout(f newClientFunc, network, address string, opts ...*server.Option) (client *Client, err error) {
-	logger.ClientLog("检查Option是否符合要求: checkOptions(opts...)")
 	opt, err := checkOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	logger.ClientLog("向服务端发送连接请求: net.DialTimeout(network, address, opt.ConnectTimeout)")
 	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
@@ -259,7 +242,6 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*server.Optio
 	}()
 	ch := make(chan clientResult)
 	go func() {
-		logger.ClientLog("调用 NewClient 函数创建一个新的客户端实例: NewClient(conn, opt)")
 		client, err := f(conn, opt)
 		ch <- clientResult{client: client, err: err}
 	}()
@@ -318,15 +300,13 @@ func (client *Client) Call(ctx context.Context, serviceMethod string, args, repl
 	//}
 	// <-client.Go(...).Done 是一个阻塞操作，它会等待 Done 通道中有数据发送过来，也就是等待远程调用完成。
 	// 一旦远程调用完成，结果会通过 Done 通道发送回来，此时 <-client.Go(...).Done 会解除阻塞并返回调用结果
-	logger.ClientLog(fmt.Sprintf("Call 方法调用 Go 方法"))
 	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
 	select {
 	case <-ctx.Done():
 		client.removeCall(call.Seq)
 		return errors.New("rpc client: call failed: " + ctx.Err().Error())
 	case call := <-call.Done:
-		logger.ClientLog(fmt.Sprintf("Call 方法接收到异步调用结果, callSeq: %d", call.Seq))
-		fmt.Println("call.Error: ", call.Error)
+		//fmt.Println("call.Error: ", call.Error)
 		return call.Error
 	}
 }
@@ -356,7 +336,7 @@ func DialHTTP(network, address string, opts ...*server.Option) (*Client, error) 
 // XDial calls different functions to connect to a RPC server
 // according the first parameter rpcAddr.
 // rpcAddr is a general format (protocol@addr) to represent a rpc server
-// eg, http@10.0.0.1:7001, tcp@10.0.0.1:9999, unix@/tmp/geerpc.sock
+// eg, http@10.0.0.1:7001, tcp@10.0.0.1:9999, unix@/tmp/minirpc.sock
 func XDial(rpcAddr string, opts ...*server.Option) (*Client, error) {
 	parts := strings.Split(rpcAddr, "@")
 	if len(parts) != 2 {

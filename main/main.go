@@ -5,9 +5,11 @@ import (
 	"log"
 	"mini-rpc/clients"
 	"mini-rpc/logger"
+	"mini-rpc/registry"
 	"mini-rpc/server"
 	"mini-rpc/types"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -61,7 +63,7 @@ import (
 //	addr := make(chan string)
 //	go startServer(addr)
 //
-//	// in fact, following code is like a simple geerpc clients
+//	// in fact, following code is like a simple minirpc clients
 //	// 客户端尝试建立连接
 //	//conn, _ := net.Dial("tcp", <-addr)
 //	logger.ClientLog("客户端尝试建立连接: clients.Dial(\"tcp\", <-addr)")
@@ -84,7 +86,7 @@ import (
 //	//		Seq:           uint64(i),
 //	//	}
 //	//	//使用编码器cc将请求头和请求体编码发送给服务端
-//	//	_ = cc.Write(h, fmt.Sprintf("geerpc req %d", h.Seq))
+//	//	_ = cc.Write(h, fmt.Sprintf("minirpc req %d", h.Seq))
 //	//
 //	//	// 检查发送的请求
 //	//	_ = cc.ReadHeader(h)
@@ -155,14 +157,187 @@ import (
 //	startServer(ch)
 //}
 
-func startServer(addrCh chan string) {
+// ----------------------------------------------------day 3----------------------------------------------------
+//type Foo int
+//
+//type Args struct{ Num1, Num2 int }
+//
+//func (f Foo) Sum(args Args, reply *int) error {
+//	*reply = args.Num1 + args.Num2
+//	return nil
+//}
+//
+//func startServer(addr chan string) {
+//	var foo Foo
+//	if err := server.Register(&foo); err != nil {
+//		log.Fatal("register error:", err)
+//	}
+//	// pick a free port
+//	l, err := net.Listen("tcp", ":0")
+//	if err != nil {
+//		log.Fatal("network error:", err)
+//	}
+//	log.Println("start rpc server on", l.Addr())
+//	addr <- l.Addr().String()
+//	server.Accept(l)
+//}
+//
+//func main() {
+//	logger.InitLogger("development")
+//	defer logger.Logger.Sync() // 确保日志缓冲区刷新
+//	log.SetFlags(0)
+//	addr := make(chan string)
+//	go startServer(addr)
+//	client, _ := clients.Dial("tcp", <-addr)
+//	defer func() { _ = client.Close() }()
+//
+//	time.Sleep(time.Second)
+//	// send request & receive response
+//	var wg sync.WaitGroup
+//	for i := 0; i < 5; i++ {
+//		wg.Add(1)
+//		go func(i int) {
+//			defer wg.Done()
+//			args := &Args{Num1: i, Num2: i * i}
+//			var reply int
+//			if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
+//				log.Fatal("call Foo.Sum error:", err)
+//			}
+//			log.Printf("%d + %d = %d", args.Num1, args.Num2, reply)
+//		}(i)
+//	}
+//	wg.Wait()
+//}
+
+// ----------------------------------------------------day 6----------------------------------------------------
+//func startServer(addrCh chan string) {
+//	var foo types.Foo
+//	l, _ := net.Listen("tcp", ":0")
+//	server := server.NewServer()
+//	_ = server.Register(&foo)
+//	log.Println("打印服务器的地址" + l.Addr().String())
+//	addrCh <- l.Addr().String()
+//	server.Accept(l)
+//}
+//
+//func foo(lbClient *clients.LoadBalancedClient, ctx context.Context, typ, serviceMethod string, args *types.Args) {
+//	var reply int
+//	var err error
+//	switch typ {
+//	case "call":
+//		err = lbClient.Call(ctx, serviceMethod, args, &reply)
+//	case "broadcast":
+//		err = lbClient.Broadcast(ctx, serviceMethod, args, &reply)
+//	}
+//	if err != nil {
+//		log.Printf("%s %s error: %v", typ, serviceMethod, err)
+//	} else {
+//		log.Printf("%s %s success: %d + %d = %d", typ, serviceMethod, args.Num1, args.Num2, reply)
+//	}
+//}
+//
+//func main() {
+//	logger.InitLogger("development")
+//	defer logger.Logger.Sync() // 确保日志缓冲区刷新
+//	log.SetFlags(0)
+//	ch1 := make(chan string)
+//	ch2 := make(chan string)
+//	// start two servers
+//	go startServer(ch1)
+//	go startServer(ch2)
+//
+//	addr1 := <-ch1
+//	addr2 := <-ch2
+//
+//	time.Sleep(time.Second)
+//	call(addr1, addr2)
+//	broadcast(addr1, addr2)
+//}
+//
+//func broadcast(addr1, addr2 string) {
+//	d := clients.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+//	xc := clients.NewLoadBalancedClient(d, clients.RandomSelect, nil)
+//	defer func() { _ = xc.Close() }()
+//	var wg sync.WaitGroup
+//	for i := 0; i < 5; i++ {
+//		wg.Add(1)
+//		go func(i int) {
+//			defer wg.Done()
+//			foo(xc, context.Background(), "broadcast", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
+//			// expect 2 - 5 timeout
+//			ctx, _ := context.WithTimeout(context.Background(), time.Second*2)
+//			foo(xc, ctx, "broadcast", "Foo.Sleep", &types.Args{Num1: i, Num2: i * i})
+//		}(i)
+//	}
+//	wg.Wait()
+//}
+//
+//func call(addr1, addr2 string) {
+//	multiServersDiscovery := clients.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+//	xc := clients.NewLoadBalancedClient(multiServersDiscovery, clients.RandomSelect, nil)
+//	defer func() { _ = xc.Close() }()
+//	// send request & receive response
+//	var wg sync.WaitGroup
+//	for i := 0; i < 5; i++ {
+//		wg.Add(1)
+//		go func(i int) {
+//			defer wg.Done()
+//			foo(xc, context.Background(), "call", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
+//		}(i)
+//	}
+//	wg.Wait()
+//}
+
+// ----------------------------------------------------day 7----------------------------------------------------
+func startRegistry(wg *sync.WaitGroup) {
+	l, _ := net.Listen("tcp", ":9999")
+	registry.HandleHTTP()
+	wg.Done()
+	_ = http.Serve(l, nil)
+}
+
+func startServer(registryAddr string, wg *sync.WaitGroup) {
 	var foo types.Foo
 	l, _ := net.Listen("tcp", ":0")
 	server := server.NewServer()
 	_ = server.Register(&foo)
-	log.Println("打印服务器的地址" + l.Addr().String())
-	addrCh <- l.Addr().String()
+	registry.Heartbeat(registryAddr, "tcp@"+l.Addr().String(), 0)
+	wg.Done()
 	server.Accept(l)
+}
+
+func call(registry string) {
+	d := clients.NewRegistryDiscovery(registry, 0)
+	lbc := clients.NewLoadBalancedClient(d, clients.RandomSelect, nil)
+	defer func() { _ = lbc.Close() }()
+	// send request & receive response
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			foo(lbc, context.Background(), "call", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
+		}(i)
+	}
+	wg.Wait()
+}
+
+func broadcast(registry string) {
+	d := clients.NewRegistryDiscovery(registry, 0)
+	lbc := clients.NewLoadBalancedClient(d, clients.RandomSelect, nil)
+	defer func() { _ = lbc.Close() }()
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			foo(lbc, context.Background(), "broadcast", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
+			// expect 2 - 5 timeout
+			ctx, _ := context.WithTimeout(context.Background(), time.Second*2)
+			foo(lbc, ctx, "broadcast", "Foo.Sleep", &types.Args{Num1: i, Num2: i * i})
+		}(i)
+	}
+	wg.Wait()
 }
 
 func foo(lbClient *clients.LoadBalancedClient, ctx context.Context, typ, serviceMethod string, args *types.Args) {
@@ -185,50 +360,19 @@ func main() {
 	logger.InitLogger("development")
 	defer logger.Logger.Sync() // 确保日志缓冲区刷新
 	log.SetFlags(0)
-	ch1 := make(chan string)
-	ch2 := make(chan string)
-	// start two servers
-	go startServer(ch1)
-	go startServer(ch2)
-
-	addr1 := <-ch1
-	addr2 := <-ch2
+	registryAddr := "http://localhost:9999/_minirpc_/registry"
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go startRegistry(&wg)
+	wg.Wait()
 
 	time.Sleep(time.Second)
-	call(addr1, addr2)
-	broadcast(addr1, addr2)
-}
-
-func broadcast(addr1, addr2 string) {
-	d := clients.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
-	xc := clients.NewLoadBalancedClient(d, clients.RandomSelect, nil)
-	defer func() { _ = xc.Close() }()
-	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			foo(xc, context.Background(), "broadcast", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
-			// expect 2 - 5 timeout
-			ctx, _ := context.WithTimeout(context.Background(), time.Second*2)
-			foo(xc, ctx, "broadcast", "Foo.Sleep", &types.Args{Num1: i, Num2: i * i})
-		}(i)
-	}
+	wg.Add(2)
+	go startServer(registryAddr, &wg)
+	go startServer(registryAddr, &wg)
 	wg.Wait()
-}
 
-func call(addr1, addr2 string) {
-	multiServersDiscovery := clients.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
-	xc := clients.NewLoadBalancedClient(multiServersDiscovery, clients.RandomSelect, nil)
-	defer func() { _ = xc.Close() }()
-	// send request & receive response
-	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			foo(xc, context.Background(), "call", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
-		}(i)
-	}
-	wg.Wait()
+	time.Sleep(time.Second)
+	call(registryAddr)
+	broadcast(registryAddr)
 }

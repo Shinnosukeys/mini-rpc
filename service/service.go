@@ -1,7 +1,6 @@
 package service
 
 import (
-	"fmt"
 	"go/ast"
 	"log"
 	"mini-rpc/logger"
@@ -65,11 +64,11 @@ func NewService(rcvr interface{}) *Service {
 	s.Name = reflect.Indirect(s.Rcvr).Type().Name()
 
 	s.Typ = reflect.TypeOf(rcvr)
-	logger.ServerLog("service类型的名称为: " + s.Typ.Elem().Name())
-	logger.ServerLog(fmt.Sprintf("该类型的方法数量为: %d", s.Typ.NumMethod()))
-	for i := 0; i < s.Typ.NumMethod(); i++ {
-		logger.ServerLog(fmt.Sprintf("第%d个方法的名称: "+s.Typ.Method(i).Name, i+1))
-	}
+	//logger.ServerLog("service类型的名称为: " + s.Typ.Elem().Name())
+	//logger.ServerLog(fmt.Sprintf("该类型的方法数量为: %d", s.Typ.NumMethod()))
+	//for i := 0; i < s.Typ.NumMethod(); i++ {
+	//	logger.ServerLog(fmt.Sprintf("第%d个方法的名称: "+s.Typ.Method(i).Name, i+1))
+	//}
 	// 检查服务名称是否为导出的标识符,如果以大写字母开头，那么它就是导出的，可以被其他包访问
 	if !ast.IsExported(s.Name) {
 		log.Fatalf("rpc server: %s is not a valid Service Name", s.Name)
@@ -104,7 +103,7 @@ func (s *Service) registerMethods() {
 			ArgType:   argType,
 			ReplyType: replyType,
 		}
-		logger.ServerLog(fmt.Sprintf("rpc serve register method: %s.%s", s.Name, method.Name))
+		//logger.ServerLog(fmt.Sprintf("rpc serve register method: %s.%s", s.Name, method.Name))
 	}
 }
 

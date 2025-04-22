@@ -15,7 +15,10 @@ import (
 type Registry struct {
 	timeout time.Duration
 	mu      sync.Mutex // protect following
-	servers map[string]*ServerItem
+	//servers map[string]*ServerItem
+
+	// 支持服务名称的注册与发现
+	services map[string]map[string]*ServerItem // key: 服务名称，value: 该服务的地址集合
 }
 
 type ServerItem struct {
@@ -31,33 +34,47 @@ const (
 // New create a registry instance with timeout setting
 func New(timeout time.Duration) *Registry {
 	return &Registry{
-		servers: make(map[string]*ServerItem),
-		timeout: timeout,
+		services: make(map[string]map[string]*ServerItem), // 初始化按服务分组的地址表
+		timeout:  timeout,
 	}
 }
 
 var DefaultRegister = New(defaultTimeout)
 
-func (r *Registry) putServer(addr string) {
+// putServer 按服务名称注册/更新服务器地址（新增服务名称参数）
+func (r *Registry) putServer(serviceName, addr string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	s := r.servers[addr]
-	if s == nil {
-		r.servers[addr] = &ServerItem{Addr: addr, start: time.Now()}
+
+	// 初始化该服务的地址表（若不存在）
+	if _, exists := r.services[serviceName]; !exists {
+		r.services[serviceName] = make(map[string]*ServerItem)
+	}
+
+	item := r.services[serviceName][addr]
+	if item == nil {
+		// 首次注册：记录地址和初始时间
+		r.services[serviceName][addr] = &ServerItem{Addr: addr, start: time.Now()}
 	} else {
-		s.start = time.Now() // if exists, update start time to keep alive
+		// 心跳更新：刷新存活时间
+		item.start = time.Now()
 	}
 }
 
-func (r *Registry) aliveServers() []string {
+func (r *Registry) aliveServers(serviceName string) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	addrs, exists := r.services[serviceName]
+	if !exists {
+		return nil
+	}
+
 	var alive []string
-	for addr, s := range r.servers {
+	for addr, s := range addrs {
 		if r.timeout == 0 || s.start.Add(r.timeout).After(time.Now()) {
 			alive = append(alive, addr)
 		} else {
-			delete(r.servers, addr)
+			delete(addrs, addr)
 		}
 	}
 	sort.Strings(alive)
@@ -65,19 +82,29 @@ func (r *Registry) aliveServers() []string {
 }
 
 // Runs at /_minirpc_/registry
+// ServeHTTP 处理注册中心HTTP请求（支持服务名称参数）
 func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	switch req.Method {
 	case "GET":
-		// keep it simple, server is in req.Header
-		w.Header().Set("X-Mini-rpc-Servers", strings.Join(r.aliveServers(), ","))
-	case "POST":
-		// keep it simple, server is in req.Header
-		addr := req.Header.Get("X-Mini-rpc-Server")
-		if addr == "" {
-			w.WriteHeader(http.StatusInternalServerError)
+		// 获取请求中的服务名称（通过查询参数或请求头，此处用查询参数示例）
+		serviceName := req.URL.Query().Get("service")
+		if serviceName == "" {
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		r.putServer(addr)
+		servers := r.aliveServers(serviceName)
+		w.Header().Set("X-Mini-rpc-Servers", strings.Join(servers, ","))
+
+	case "POST":
+		// 接收服务名称和地址（通过请求头传递）
+		serviceName := req.Header.Get("X-Mini-rpc-Service")
+		addr := req.Header.Get("X-Mini-rpc-Server")
+		if serviceName == "" || addr == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		r.putServer(serviceName, addr) // 按服务名称注册地址
+
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -95,28 +122,39 @@ func HandleHTTP() {
 
 // Heartbeat send a heartbeat message every once in a while
 // it's a helper function for a server to register or send heartbeat
-func Heartbeat(registry, addr string, duration time.Duration) {
+// Heartbeat 服务器心跳函数（新增服务名称参数）
+func Heartbeat(registryURL, serviceName, addr string, duration time.Duration) {
 	if duration == 0 {
-		// make sure there is enough time to send heart beat
-		// before it's removed from registry
-		duration = defaultTimeout - time.Duration(1)*time.Minute
+		duration = defaultTimeout - time.Minute // 预留1分钟缓冲时间
 	}
 	var err error
-	err = sendHeartbeat(registry, addr)
+	// 首次注册
+	if err = sendHeartbeat(registryURL, serviceName, addr); err != nil {
+		log.Printf("initial heartbeat failed: %v", err)
+	}
+
+	// 定时发送心跳
 	go func() {
-		t := time.NewTicker(duration)
-		for err == nil {
-			<-t.C
-			err = sendHeartbeat(registry, addr)
+		ticker := time.NewTicker(duration)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				err = sendHeartbeat(registryURL, serviceName, addr)
+				if err != nil {
+					log.Printf("heartbeat failed: %v", err)
+				}
+			}
 		}
 	}()
 }
 
-func sendHeartbeat(registry, addr string) error {
+func sendHeartbeat(registry, serviceName, addr string) error {
 	log.Println(addr, "send heart beat to registry", registry)
 	httpClient := &http.Client{}
 	req, _ := http.NewRequest("POST", registry, nil)
-	req.Header.Set("X-Mini-rpc-Server", addr)
+	req.Header.Set("X-Mini-rpc-Service", serviceName) // 服务名称头
+	req.Header.Set("X-Mini-rpc-Server", addr)         // 地址头
 	if _, err := httpClient.Do(req); err != nil {
 		log.Println("rpc server: heart beat err:", err)
 		return err

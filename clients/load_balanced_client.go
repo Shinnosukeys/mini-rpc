@@ -73,8 +73,8 @@ func (l *LoadBalancedClient) call(rpcAddr string, ctx context.Context, serviceMe
 // Call invokes the named function, waits for it to complete,
 // and returns its error status.
 // xc will choose a proper server.
-func (l *LoadBalancedClient) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
-	rpcAddr, err := l.d.Get(l.mode)
+func (l *LoadBalancedClient) Call(ctx context.Context, serviceName, serviceMethod string, args, reply interface{}) error {
+	rpcAddr, err := l.d.Get(serviceName, l.mode)
 	if err != nil {
 		return err
 	}
@@ -82,9 +82,9 @@ func (l *LoadBalancedClient) Call(ctx context.Context, serviceMethod string, arg
 }
 
 // Broadcast invokes the named function for every server registered in discovery
-func (l *LoadBalancedClient) Broadcast(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+func (l *LoadBalancedClient) Broadcast(ctx context.Context, serviceName, serviceMethod string, args, reply interface{}) error {
 	// 获取所有可用的服务器地址
-	servers, err := l.d.GetAll()
+	servers, err := l.d.GetAll(serviceName)
 	if err != nil {
 		return err
 	}

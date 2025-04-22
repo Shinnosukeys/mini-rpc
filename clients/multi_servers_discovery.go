@@ -9,10 +9,10 @@ import (
 )
 
 type Discovery interface {
-	Refresh() error // refresh from remote registry
-	Update(servers []string) error
-	Get(mode SelectMode) (string, error)
-	GetAll() ([]string, error)
+	Refresh(serviceName string) error                        // 按服务名刷新地址（可选，非注册中心场景可空实现）
+	Update(serviceName string, servers []string) error       // 按服务名更新地址
+	Get(serviceName string, mode SelectMode) (string, error) // 按服务名和负载模式获取地址
+	GetAll(serviceName string) ([]string, error)             // 按服务名获取所有地址
 }
 
 var _ Discovery = (*MultiServersDiscovery)(nil)
@@ -20,59 +20,73 @@ var _ Discovery = (*MultiServersDiscovery)(nil)
 // MultiServersDiscovery is a discovery for multi servers without a registry center
 // user provides the server addresses explicitly instead
 type MultiServersDiscovery struct {
-	r       *rand.Rand   // generate random number
-	mu      sync.RWMutex // protect following
-	servers []string
-	index   int // record the selected position for robin algorithm
+	r        *rand.Rand          // 随机数生成器
+	mu       sync.RWMutex        // 保护并发访问
+	services map[string][]string // 服务名称 -> 地址列表（核心改造点）
+	index    map[string]int      // 轮询算法的索引（按服务名隔离，避免不同服务轮询互相影响）
 }
 
-func (m *MultiServersDiscovery) Refresh() error {
+func NewMultiServerDiscovery(services map[string][]string) *MultiServersDiscovery {
+	d := &MultiServersDiscovery{
+		services: make(map[string][]string),
+		index:    make(map[string]int),
+		r:        rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+	// 初始化各服务的地址和轮询索引
+	for serviceName, servers := range services {
+		d.services[serviceName] = servers
+		d.index[serviceName] = d.r.Intn(math.MaxInt32 - 1) // 随机初始轮询位置
+	}
+	return d
+}
+
+// Refresh 非注册中心场景无需刷新（空实现）
+func (m *MultiServersDiscovery) Refresh(serviceName string) error {
 	return nil
 }
 
-func (m *MultiServersDiscovery) Update(servers []string) error {
+// Update 按服务名更新地址列表（支持动态添加/修改服务）
+func (m *MultiServersDiscovery) Update(serviceName string, servers []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.servers = servers
+	m.services[serviceName] = servers
+	// 重置轮询索引（避免旧索引指向已删除的地址）
+	m.index[serviceName] = m.r.Intn(math.MaxInt32 - 1)
 	return nil
 }
 
-func (m *MultiServersDiscovery) Get(mode SelectMode) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	n := len(m.servers)
-	if n == 0 {
-		return "", errors.New("rpc discovery: no available servers")
-	}
-	switch mode {
-	case RandomSelect:
-		return m.servers[m.r.Intn(n)], nil
-	case RoundRobinSelect:
-		s := m.servers[m.index%n] // servers could be updated, so mode n to ensure safety
-		m.index = (m.index + 1) % n
-		return s, nil
-	default:
-		return "", errors.New("rpc discovery: not supported select mode")
-	}
-}
-
-func (m *MultiServersDiscovery) GetAll() ([]string, error) {
+// Get 按服务名和负载模式获取单个地址
+func (m *MultiServersDiscovery) Get(serviceName string, mode SelectMode) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	// return a copy of d.servers
-	servers := make([]string, len(m.servers), len(m.servers))
-	copy(servers, m.servers)
-	return servers, nil
+	servers, exists := m.services[serviceName]
+	if !exists || len(servers) == 0 {
+		return "", errors.New("discovery: service not found or no available servers")
+	}
+	n := len(servers)
+	switch mode {
+	case RandomSelect:
+		return servers[m.r.Intn(n)], nil
+	case RoundRobinSelect:
+		idx := m.index[serviceName] % n
+		m.index[serviceName] = (idx + 1) % n // 轮询索引独立递增（按服务名隔离）
+		return servers[idx], nil
+	default:
+		return "", errors.New("discovery: unsupported select mode")
+	}
 }
 
 // NewMultiServerDiscovery creates a MultiServersDiscovery instance
-func NewMultiServerDiscovery(servers []string) *MultiServersDiscovery {
-	d := &MultiServersDiscovery{
-		servers: servers,
-		// 一个产生随机数的实例，初始化时使用时间戳设定随机数种子，避免每次产生相同的随机数序列
-		r: rand.New(rand.NewSource(time.Now().UnixNano())),
+// GetAll 按服务名获取所有地址（返回副本，避免并发修改）
+func (m *MultiServersDiscovery) GetAll(serviceName string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	servers, exists := m.services[serviceName]
+	if !exists {
+		return nil, errors.New("discovery: service not found")
 	}
-	// index 记录 Round Robin 算法已经轮询到的位置，为了避免每次从 0 开始，初始化时随机设定一个值
-	d.index = d.r.Intn(math.MaxInt32 - 1)
-	return d
+	// 返回地址副本，防止外部修改影响内部状态
+	copied := make([]string, len(servers))
+	copy(copied, servers)
+	return copied, nil
 }

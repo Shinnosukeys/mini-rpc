@@ -301,7 +301,7 @@ func startServer(registryAddr string, wg *sync.WaitGroup) {
 	l, _ := net.Listen("tcp", ":0")
 	server := server.NewServer()
 	_ = server.Register(&foo)
-	registry.Heartbeat(registryAddr, "tcp@"+l.Addr().String(), 0)
+	registry.Heartbeat(registryAddr, "ComputeService", "tcp@"+l.Addr().String(), 0)
 	wg.Done()
 	server.Accept(l)
 }
@@ -316,7 +316,7 @@ func call(registry string) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			foo(lbc, context.Background(), "call", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
+			foo(lbc, context.Background(), "call", "ComputeService", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
 		}(i)
 	}
 	wg.Wait()
@@ -331,23 +331,23 @@ func broadcast(registry string) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			foo(lbc, context.Background(), "broadcast", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
+			foo(lbc, context.Background(), "broadcast", "ComputeService", "Foo.Sum", &types.Args{Num1: i, Num2: i * i})
 			// expect 2 - 5 timeout
 			ctx, _ := context.WithTimeout(context.Background(), time.Second*2)
-			foo(lbc, ctx, "broadcast", "Foo.Sleep", &types.Args{Num1: i, Num2: i * i})
+			foo(lbc, ctx, "broadcast", "ComputeService", "Foo.Sleep", &types.Args{Num1: i, Num2: i * i})
 		}(i)
 	}
 	wg.Wait()
 }
 
-func foo(lbClient *clients.LoadBalancedClient, ctx context.Context, typ, serviceMethod string, args *types.Args) {
+func foo(lbClient *clients.LoadBalancedClient, ctx context.Context, typ, serviceName, serviceMethod string, args *types.Args) {
 	var reply int
 	var err error
 	switch typ {
 	case "call":
-		err = lbClient.Call(ctx, serviceMethod, args, &reply)
+		err = lbClient.Call(ctx, serviceName, serviceMethod, args, &reply)
 	case "broadcast":
-		err = lbClient.Broadcast(ctx, serviceMethod, args, &reply)
+		err = lbClient.Broadcast(ctx, serviceName, serviceMethod, args, &reply)
 	}
 	if err != nil {
 		log.Printf("%s %s error: %v", typ, serviceMethod, err)
